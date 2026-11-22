@@ -28,6 +28,16 @@ class JacobianLens:
         source_layers: Sorted list of fitted layer indices.
         n_prompts: Number of prompts the lens was averaged over.
         d_model: Residual-stream width.
+        meta: Free-form provenance the fitter attaches, such as the corpus,
+            the estimator, and the fit date. Values must be plain JSON types
+            (str, int, float, bool, list, dict), because :meth:`load` reads the
+            file with ``weights_only=True``. :meth:`save` writes it, and
+            :meth:`load` gives it back. An old file without it loads with an
+            empty dict.
+
+    Warning: :meth:`transport` caches a device copy of each ``J_l``. Do not
+    change :attr:`jacobians` after you build the lens. If you must change it,
+    clear ``_device_cache`` or build the lens again.
     """
 
     def __init__(
@@ -36,11 +46,15 @@ class JacobianLens:
         *,
         n_prompts: int,
         d_model: int,
+        meta: dict | None = None,
     ) -> None:
         self.jacobians = {layer: J.float() for layer, J in jacobians.items()}
         self.source_layers = sorted(self.jacobians)
         self.n_prompts = n_prompts
         self.d_model = d_model
+        self.meta = dict(meta or {})
+        # transport() fills this: {(layer, str(device)): J on that device}.
+        self._device_cache: dict = {}
 
     def __repr__(self) -> str:
         return (
@@ -52,20 +66,32 @@ class JacobianLens:
     def save(self, path: str, *, dtype: torch.dtype = torch.float16) -> None:
         """Save to ``path``. Jacobians are stored as ``dtype`` (default fp16:
         halves file size; entries are O(1) so the range is not a constraint
-        and fp16's extra mantissa bits beat bf16 here)."""
+        and fp16's extra mantissa bits beat bf16 here).
+
+        Warning: a shard that a merge reads again must go to disk as fp32. The
+        fp16 error does not cancel in the weighted mean.
+
+        The file also carries :attr:`meta` and the name of ``dtype``.
+        """
         torch.save(
             {
                 "J": {layer: J.to(dtype) for layer, J in self.jacobians.items()},
                 "n_prompts": self.n_prompts,
                 "source_layers": self.source_layers,
                 "d_model": self.d_model,
+                "meta": self.meta,
+                "save_dtype": str(dtype),
             },
             path,
         )
 
     @classmethod
     def load(cls, path: str) -> JacobianLens:
-        """Load a lens previously written by :meth:`save`."""
+        """Load a lens previously written by :meth:`save`.
+
+        A file from an older version has no ``meta`` key. Such a file loads
+        with an empty :attr:`meta`.
+        """
         checkpoint = torch.load(path, map_location="cpu", weights_only=True)
         if "J" not in checkpoint:
             raise ValueError(
@@ -76,6 +102,7 @@ class JacobianLens:
             jacobians=checkpoint["J"],
             n_prompts=checkpoint["n_prompts"],
             d_model=checkpoint["d_model"],
+            meta=checkpoint.get("meta", {}),
         )
 
     @classmethod
@@ -107,6 +134,9 @@ class JacobianLens:
         """Combine lenses fitted on disjoint prompt subsets into one
         (``n_prompts``-weighted mean of the inputs).
 
+        The merged lens gets a ``meta`` that keeps each part's prompt count and
+        each part's own ``meta``.
+
         Args:
             lenses: Lenses to merge. Must agree on ``source_layers`` and
                 ``d_model``.
@@ -130,16 +160,38 @@ class JacobianLens:
                 lens.jacobians[layer] * lens.n_prompts for lens in lenses
             )
             merged[layer] = weighted_sum / n_total
-        return cls(jacobians=merged, n_prompts=n_total, d_model=first.d_model)
+        meta = {
+            "merged": True,
+            "parts": [
+                {"n_prompts": lens.n_prompts, **lens.meta} for lens in lenses
+            ],
+        }
+        return cls(
+            jacobians=merged,
+            n_prompts=n_total,
+            d_model=first.d_model,
+            meta=meta,
+        )
 
     def transport(self, residual: torch.Tensor, layer: int) -> torch.Tensor:
         """Map a residual at ``layer`` into the final-layer basis: ``J_l @ h``.
+
+        The device copy of each ``J_l`` goes into a cache, keyed by the layer
+        and the device. A long read thus moves each matrix one time only.
+
+        Warning: the cache assumes that :attr:`jacobians` does not change after
+        you build the lens. A caller that changes it must clear
+        ``_device_cache`` or build the lens again.
 
         Args:
             residual: Tensor of shape ``[..., d_model]``.
             layer: Source layer index (must be in :attr:`source_layers`).
         """
-        J_bar = self.jacobians[layer].to(residual.device)
+        key = (layer, str(residual.device))
+        J_bar = self._device_cache.get(key)
+        if J_bar is None:
+            J_bar = self.jacobians[layer].to(residual.device)
+            self._device_cache[key] = J_bar
         return residual @ J_bar.T
 
     @torch.no_grad()
